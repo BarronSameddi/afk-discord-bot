@@ -361,7 +361,7 @@ async def refresh_afk_list_message() -> None:
 
     if target_message is None:
         try:
-            target_message = await channel.send(embed=embed)
+            target_message = await channel.send(embed=embed, view=AFKListView())
         except discord.Forbidden:
             return
         except discord.HTTPException:
@@ -372,7 +372,7 @@ async def refresh_afk_list_message() -> None:
         return
 
     try:
-        await target_message.edit(embed=embed)
+        await target_message.edit(embed=embed, view=AFKListView())
     except discord.Forbidden:
         return
     except discord.HTTPException:
@@ -382,6 +382,116 @@ async def refresh_afk_list_message() -> None:
 @tasks.loop(seconds=60)
 async def afk_list_updater() -> None:
     await refresh_afk_list_message()
+
+
+async def submit_afk_report(
+    interaction: discord.Interaction,
+    game_nick: str,
+    static_code: str,
+    duration_text: str,
+    reason: str,
+) -> tuple[bool, str, Optional[int]]:
+    if not interaction.guild:
+        return False, "Команда доступна только на сервере.", None
+
+    parsed_duration = parse_afk_duration(duration_text)
+    if parsed_duration is None:
+        return False, "Неверный формат времени AFK. Используй: 2ч, 30м или 1д.", None
+
+    until_at_utc = utc_now() + parsed_duration
+    until_text = until_at_utc.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+
+    async with db_lock:
+        if has_recent_duplicate(
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+            game_nick=game_nick,
+            static_code=static_code,
+            duration_text=duration_text,
+            reason=reason,
+        ):
+            return False, "Похожая заявка уже была создана только что. Подожди пару секунд.", None
+
+        report_id = insert_report(
+            guild_id=interaction.guild.id,
+            user_id=interaction.user.id,
+            user_tag=str(interaction.user),
+            reason=reason,
+            until_text=until_text,
+            game_nick=game_nick,
+            static_code=static_code,
+            duration_text=duration_text,
+            comment="",
+            until_at=until_at_utc.isoformat(),
+        )
+
+    review_channel = interaction.guild.get_channel(AFK_REVIEW_CHANNEL_ID)
+    if not isinstance(review_channel, discord.TextChannel):
+        return False, "Канал для заявок не найден. Проверь AFK_REVIEW_CHANNEL_ID.", None
+
+    embed = create_embed(
+        report_id=report_id,
+        user_tag=str(interaction.user),
+        user_id=interaction.user.id,
+        reason=reason,
+        until_text=until_text,
+        game_nick=game_nick,
+        static_code=static_code,
+        duration_text=duration_text,
+        status="pending",
+    )
+    try:
+        role_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(MODERATOR_ROLE_IDS))
+        mention_text = f"{role_mentions} новая AFK-заявка." if role_mentions else "Новая AFK-заявка."
+        await review_channel.send(
+            content=mention_text,
+            embed=embed,
+            view=DecisionView(),
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+    except discord.Forbidden:
+        return (
+            False,
+            "Я не вижу канал заявок или не могу туда писать. Проверь права бота и AFK_REVIEW_CHANNEL_ID.",
+            None,
+        )
+    except discord.HTTPException:
+        return False, "Не удалось отправить заявку из-за ошибки Discord API. Попробуй снова через минуту.", None
+
+    return True, f"Заявка #{report_id} отправлена на проверку.", report_id
+
+
+class AFKReportModal(discord.ui.Modal, title="AFK отчет"):
+    game_nick = discord.ui.TextInput(label="Ваш ник в игре", max_length=64, required=True)
+    static_code = discord.ui.TextInput(label="Статик #", max_length=32, required=True)
+    duration_text = discord.ui.TextInput(
+        label="Время AFK (2ч / 30м / 1д)",
+        max_length=16,
+        required=True,
+        placeholder="Например: 1д",
+    )
+    reason = discord.ui.TextInput(label="Причина", style=discord.TextStyle.paragraph, max_length=512, required=True)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        ok, message, _ = await submit_afk_report(
+            interaction=interaction,
+            game_nick=str(self.game_nick),
+            static_code=str(self.static_code),
+            duration_text=str(self.duration_text),
+            reason=str(self.reason),
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        if ok:
+            await refresh_afk_list_message()
+
+
+class AFKListView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="AFK отчет", style=discord.ButtonStyle.primary, custom_id="afk_open_report_modal")
+    async def open_report_modal(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AFKReportModal())
 
 
 class DecisionView(discord.ui.View):
@@ -501,6 +611,7 @@ class DecisionView(discord.ui.View):
 @bot.event
 async def on_ready() -> None:
     init_db()
+    bot.add_view(AFKListView())
     bot.add_view(DecisionView())
     guild = discord.Object(id=GUILD_ID)
     await bot.tree.sync(guild=guild)
@@ -524,94 +635,14 @@ async def afk(
     duration_text: str,
     reason: str,
 ) -> None:
-    if not interaction.guild:
-        await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
-        return
-
-    parsed_duration = parse_afk_duration(duration_text)
-    if parsed_duration is None:
-        await interaction.response.send_message(
-            "Неверный формат времени AFK. Используй: 2ч, 30м или 1д.",
-            ephemeral=True,
-        )
-        return
-
-    until_at_utc = utc_now() + parsed_duration
-    until_text = until_at_utc.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
-
-    async with db_lock:
-        if has_recent_duplicate(
-            guild_id=interaction.guild.id,
-            user_id=interaction.user.id,
-            game_nick=game_nick,
-            static_code=static_code,
-            duration_text=duration_text,
-            reason=reason,
-        ):
-            await interaction.response.send_message(
-                "Похожая заявка уже была создана только что. Подожди пару секунд.",
-                ephemeral=True,
-            )
-            return
-
-        report_id = insert_report(
-            guild_id=interaction.guild.id,
-            user_id=interaction.user.id,
-            user_tag=str(interaction.user),
-            reason=reason,
-            until_text=until_text,
-            game_nick=game_nick,
-            static_code=static_code,
-            duration_text=duration_text,
-            comment="",
-            until_at=until_at_utc.isoformat(),
-        )
-
-    review_channel = interaction.guild.get_channel(AFK_REVIEW_CHANNEL_ID)
-    if not isinstance(review_channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "Канал для заявок не найден. Проверь AFK_REVIEW_CHANNEL_ID.",
-            ephemeral=True,
-        )
-        return
-
-    embed = create_embed(
-        report_id=report_id,
-        user_tag=str(interaction.user),
-        user_id=interaction.user.id,
-        reason=reason,
-        until_text=until_text,
+    _, message, _ = await submit_afk_report(
+        interaction=interaction,
         game_nick=game_nick,
         static_code=static_code,
         duration_text=duration_text,
-        status="pending",
+        reason=reason,
     )
-    try:
-        role_mentions = " ".join(f"<@&{role_id}>" for role_id in sorted(MODERATOR_ROLE_IDS))
-        mention_text = f"{role_mentions} новая AFK-заявка." if role_mentions else "Новая AFK-заявка."
-        await review_channel.send(
-            content=mention_text,
-            embed=embed,
-            view=DecisionView(),
-            allowed_mentions=discord.AllowedMentions(roles=True),
-        )
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "Я не вижу канал заявок или не могу туда писать. Проверь права бота и AFK_REVIEW_CHANNEL_ID.",
-            ephemeral=True,
-        )
-        return
-    except discord.HTTPException:
-        await interaction.response.send_message(
-            "Не удалось отправить заявку из-за ошибки Discord API. Попробуй снова через минуту.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.send_message(
-        f"Заявка #{report_id} отправлена на проверку.",
-        ephemeral=True,
-    )
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 if __name__ == "__main__":
