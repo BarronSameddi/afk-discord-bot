@@ -161,6 +161,10 @@ def create_embed(
         "approved": "Принято",
         "rejected": "Отклонено",
     }
+    reviewer_field_map = {
+        "approved": "Принял",
+        "rejected": "Отклонил",
+    }
 
     embed = discord.Embed(color=color_map.get(status, discord.Color.blurple()))
     embed.set_author(name=f"AFK-заявка #{report_id}")
@@ -173,7 +177,7 @@ def create_embed(
     embed.add_field(name="ID", value=str(user_id), inline=False)
     embed.add_field(name="Кого", value=f"<@{user_id}>", inline=True)
     embed.add_field(
-        name="Принял",
+        name=reviewer_field_map.get(status, "Рассмотрел"),
         value=(f"<@{reviewed_by_id}>" if reviewed_by_id else "—"),
         inline=True,
     )
